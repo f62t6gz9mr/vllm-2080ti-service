@@ -99,6 +99,10 @@
 - `temperature` 实测：T=1 不比 T=0 慢（拒绝采样比严格匹配对草稿更宽容，接受长度反而更高）。
 - `xhigh` 思考档在部分题上过度反刍（思考 2.5 万字顶满 max_tokens、正文 0 字），不是"更聪明"的通用开关。
 
+## 待解决问题
+
+见 [TODO.md](TODO.md)——190G 顶格抖动观察、盘速硬件瓶颈、update.sh 覆盖补丁、读盘档精确测试、网关预取（未实现）、CPU 降频、IP 漂移等，按影响排序，附死路备忘。
+
 ## 许可与致谢
 
 - 上游：[vllm-project/vllm](https://github.com/vllm-project/vllm)（Apache-2.0）
