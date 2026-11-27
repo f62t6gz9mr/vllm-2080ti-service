@@ -65,13 +65,15 @@
 | `0001` launcher.sh | `ALLOW_KV_OVERCOMMIT=1` 放宽"每槽满上下文"KV 预检（本机 272K 池 < 2×262K）；`kv_load_failure_policy=recompute`（运行中删盘块只重算不报 500——这是 kv-cleaner 敢在线删块的**安全前提**）；`KV_MEM_ONLY=1` 只建内存层不挂盘层 |
 | `0002` checkpoint_fingerprint.py | 权重指纹缓存：stat 不变则秒回，启动省 ~13 分钟（实测全程 25-33min → ~14min） |
 | `0003` shared_offload_region.py | EFAULT 也视为 cudaHostRegister 不支持，直接走逐页写 fallback |
-| `0004` cpu/manager.py | KV_PASSTHRU 直通 + 补丁 7B：在途块 pin 名单，防被 LRU 误逐 |
-| `0005` tiering/manager.py | 补丁 7B 配套：盘签收后转正释放，镜像队列不被写盘尾巴挤爆 |
+| `0004` cpu/manager.py | KV_PASSTHRU 直通 + 补丁 7B：在途块 pin 名单，防被 LRU 误逐。⚠️ **已知运行期崩溃风险，见 [docs/crash-20261127-2041.md](docs/crash-20261127-2041.md)** |
+| `0005` tiering/manager.py | 补丁 7B 配套：盘签收后转正释放，镜像队列不被写盘尾巴挤爆。⚠️ 同上 |
 | `0006` tiering/fs/manager.py | 补丁 8+9：读盘/写盘并行组（`KV_FS_PARALLEL` / `KV_FS_STORE_GROUP` / `KV_FS_READ_THREADS` / `KV_FS_WRITE_THREADS`）。写盘原来单线程 ~55MB/s 是全链路最窄处 |
+
+> ⚠️ **2026-11-27 事故**：`KV_PASSTHRU=1`（补丁 4/5）上线后首个实例存活 5h19m 后崩在 stock vLLM 的滑窗块数断言（`offloading/scheduler.py:1152`），崩前 `cannot store chunks` 持续刷屏 10 分钟。完整复盘、日志证据与根因推断见 **[docs/crash-20261127-2041.md](docs/crash-20261127-2041.md)**。在对照实验（PASSTHRU=0 vs 1，同负载同盘顶）做完之前，生产档建议 `KV_PASSTHRU=0`。
 
 ### 死路清单（我们都试过了，别再试）
 
-- **动块的存亡/归还时机**（落盘即释放、LRU 镜像保护、SGLang 式写回）→ 必崩在 `offloading/scheduler.py` 的 free_list 账本断言。vLLM 禁区。
+- **动块的存亡/归还时机**（落盘即释放、LRU 镜像保护、SGLang 式写回）→ 必崩在 `offloading/scheduler.py` 的 free_list 账本断言。vLLM 禁区。**补丁 7B（pin 名单）以为绕开了（只动 evictable 队列、不动块存亡），结果 11-27 在同一文件换了一条断言（`num_pending_gpu_blocks` 滑窗预算）崩了，而且潜伏 5 小时才崩** —— 见 [docs/crash-20261127-2041.md](docs/crash-20261127-2041.md)。这条禁区要按"连驱逐资格都不能改"重新理解。
 - **跳过 cudaHostRegister 的"lazy-pin"** → 表面省内存，实际 store DMA 全废（`cannot store chunks` 刷屏、切回=全量重算）。tmpfs 本来就按需占物理页，注册只是标 DMA 范围。
 - `madvise(POPULATE_WRITE)` 探测在本内核 EFAULT。
 - 换 SGLang：NVFP4/Turing 不支持。
