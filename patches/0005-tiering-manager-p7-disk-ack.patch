@@ -1,0 +1,102 @@
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 0940aaeae0..ef35b1824e 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -202,6 +202,7 @@ class TieringOffloadingManager(OffloadingManager):
+         #   True:  secondary → primary (promotion)
+         #   False: primary → secondary (cascade)
+         self._jobs: dict[JobId, JobMetadata] = {}
++        self._wb_job_ids: set = set()  # PATCH 6
+         primary_view = self.primary_tier.get_kv_memoryview()
+         assert primary_view.strides is not None
+         self._metrics = TieringMetricsTracker(
+@@ -241,6 +242,38 @@ class TieringOffloadingManager(OffloadingManager):
+         self._job_id_counter += 1
+         return job_id
+ 
++    def _wb_enabled(self) -> bool:
++        """PATCH 6: 写回模式开关 (CPU 主层环境变量 KV_WRITEBACK=1)。"""
++        return bool(getattr(self.primary_tier, "writeback", False))
++
++    def _submit_writeback(self, req_context: ReqContext) -> None:
++        """PATCH 6 SGLang write-back: 把被驱逐但还没上盘的砖提交落盘。
++        这些 chunk 已被 LRU 摘走但槽位被 cpu 层扣住 (数据还在!), 用扣住的
++        chunk_id 直接建 job —— 不经过 prepare_read (那会对缺席 key assert)。"""
++        if not self.secondary_tiers:
++            return
++        items = self.primary_tier.wb_drain_pending()
++        if not items:
++            return
++        keys = [k for k, _ in items]
++        chunk_ids = np.array([c.chunk_id for _, c in items], dtype=np.int32)
++        job_metadata = TransferJob(
++            job_id=self._next_job_id(),
++            keys=keys,
++            chunk_ids=chunk_ids,
++            is_promotion=False,
++            req_context=req_context,
++        )
++        try:
++            tier = self.secondary_tiers[0]
++            self._register_job(job_metadata, 0)
++            self._wb_job_ids.add(job_metadata.job_id)
++            tier.submit_store(job_metadata)
++        except Exception:
++            self._wb_job_ids.discard(job_metadata.job_id)
++            self._jobs.pop(job_metadata.job_id, None)
++            self.primary_tier.wb_requeue(items)
++
+     def _register_job(self, transfer_job: TransferJob, tier_idx: int) -> None:
+         job_metadata = JobMetadata(transfer_job, tier_idx)
+         self._jobs[transfer_job.job_id] = job_metadata
+@@ -289,6 +322,11 @@ class TieringOffloadingManager(OffloadingManager):
+                 transfer_job.req_context,
+                 True,
+             )
++            # PATCH 6: 晋升来的砖盘上有原件, 免于再次写回
++            self.primary_tier.wb_mark_on_disk(successful_keys)
++            # PATCH 7B: 晋升砖是盘上原件的副本, 无需等盘签收, 当场转正
++            if getattr(self.primary_tier, "passthru", False):
++                self.primary_tier.pt_unpin_on_disk(successful_keys)
+         if failed_keys:
+             self.primary_tier.complete_write(
+                 failed_keys,
+@@ -326,7 +364,18 @@ class TieringOffloadingManager(OffloadingManager):
+                     # secondary→primary transfer (promotion) completed.
+                     # Make chunks available in primary tier.
+                     self._complete_promotion(job_metadata, completed_job)
++                elif job_id in self._wb_job_ids:
++                    # PATCH 6 写回落盘完成: 记盘账 + 归还扣住的槽位。
++                    self._wb_job_ids.discard(job_id)
++                    self.primary_tier.wb_finish(
++                        transfer_job.keys, completed_job.success
++                    )
+                 else:
++                    # PATCH 7B: 盘签收 -> 在途砖先转正, 再走常规 ref 收尾
++                    # (先解后收: 若砖正被级联读 pin 着, ref>0, unpin 只摘牌,
++                    #  等 complete_read 把它归零后再由 mark_evictable 补进队列)
++                    if getattr(self.primary_tier, "passthru", False):
++                        self.primary_tier.pt_unpin_on_disk(transfer_job.keys)
+                     # primary→secondary transfer completed.
+                     # Decrement ref_cnt on primary chunks.
+                     self.primary_tier.complete_read(
+@@ -588,6 +637,10 @@ class TieringOffloadingManager(OffloadingManager):
+             state = self._req_state[req_context.req_id]
+             state.pending_primary_stores += 1
+ 
++        # PATCH 6: 本次分配驱逐了未落盘的砖 -> 立刻写回落盘。
++        if self._wb_enabled() and primary_result.evicted_keys:
++            self._submit_writeback(req_context)
++
+         # Step 3: For request-level tiers, cascade chunks already in primary
+         request_level_tiers = self._req_state[req_context.req_id].request_level_tiers
+         if request_level_tiers:
+@@ -686,7 +739,7 @@ class TieringOffloadingManager(OffloadingManager):
+         # Step 1: Complete store in primary tier (makes chunks loadable)
+         self.primary_tier.complete_store(keys, req_context, success)
+ 
+-        if success:
++        if success and not self._wb_enabled():
+             # Step 2: Cascade to ALL secondary tiers
+             # For each secondary tier, call primary.prepare_read() to get the
+             # LoadStoreSpec AND to increment ref_cnt (protecting chunks from

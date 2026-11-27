@@ -1,0 +1,114 @@
+diff --git a/launcher.sh b/launcher.sh
+index 293891285b..2d7cf2a6bf 100755
+--- a/launcher.sh
++++ b/launcher.sh
+@@ -182,6 +182,30 @@ validate_configured_kv_concurrency() {
+   if [[ ! "$max_num_seqs" =~ ^[1-9][0-9]*$ ]] || (( max_num_seqs <= 1 )); then
+     return 0
+   fi
++  # LOCAL PATCH (2026-11-21) ALLOW_KV_OVERCOMMIT=1
++  # 官方预检要求 KV池 >= MAX_NUM_SEQS x MAX_MODEL_LEN，即"每个槽位都要能装下满上下文"。
++  # 本地改为总量预检：KV池 >= MAX_MODEL_LEN 即可启动，多个会话按 sum(KV) 共享 26.4 万 tokens，
++  # 超过就排队/由 scheduler 抢占（num_computed_tokens=0 重算）。代价：两个会话同时接近满上下文时
++  # 会互相抢占。真实并发由网关 :8001 的 MAX_INFLIGHT 排队控制。update.sh 会覆盖本文件，需重打。
++  if [[ "${ALLOW_KV_OVERCOMMIT:-0}" == "1" ]]; then
++    if [[ ! "$max_model_len" =~ ^[1-9][0-9]*$ ]]; then
++      echo "ERROR: cannot validate KV capacity: invalid MAX_MODEL_LEN=$max_model_len" >&2
++      return 1
++    fi
++    total=$(kv_cache_total_tokens_from_log "$log_file" 2>/dev/null || true)
++    if [[ ! "$total" =~ ^[1-9][0-9]*$ ]]; then
++      echo "ERROR: cannot validate KV capacity: GPU KV token capacity is missing from the startup log." >&2
++      return 1
++    fi
++    if (( total < max_model_len )); then
++      echo "ERROR: single request context does not fit in the allocated GPU KV cache." >&2
++      echo "  GPU KV tokens: $total / MAX_MODEL_LEN: $max_model_len" >&2
++      return 1
++    fi
++    echo "KV concurrency check: OVERCOMMIT (KV $total tokens shared by up to $max_num_seqs requests, each <= $max_model_len; sum > pool = preempt/requeue)"
++    return 0
++  fi
++
+   if [[ ! "$max_model_len" =~ ^[1-9][0-9]*$ ]]; then
+     echo "ERROR: cannot validate KV concurrency: invalid MAX_MODEL_LEN=$max_model_len" >&2
+     return 1
+@@ -885,6 +909,7 @@ NON_INTERACTIVE_CONFIG_KEYS=(
+   ENABLE_PREFIX_CACHING
+   KV_DISK_CACHE_DIR
+   KV_DISK_CPU_BYTES
++  KV_MEM_ONLY
+   ENABLE_YARN
+   ENABLE_PROMPT_TOKENS_DETAILS
+   DISABLE_PREFIX_CACHING
+@@ -1746,6 +1771,15 @@ current_prefix_cache_label() {
+ }
+ 
+ validate_disk_kv_cache_config() {
++  # LOCAL PATCH (2026-11-26) KV_MEM_ONLY=1: 仍需 cpu_bytes, 但不需要目录/指纹.
++  if [[ "${KV_MEM_ONLY:-0}" == "1" ]]; then
++    [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
++    if [[ ! "${KV_DISK_CPU_BYTES:-}" =~ ^[1-9][0-9]*$ ]]; then
++      echo "ERROR: KV_MEM_ONLY requires KV_DISK_CPU_BYTES (positive bytes)." >&2
++      return 1
++    fi
++    return 0
++  fi
+   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
+   if [[ "$KV_DISK_CACHE_DIR" != /* ]]; then
+     echo "ERROR: KV_DISK_CACHE_DIR must be an absolute path." >&2
+@@ -1766,6 +1800,22 @@ validate_disk_kv_cache_config() {
+ }
+ 
+ disk_kv_transfer_config() {
++  # LOCAL PATCH (2026-11-26) KV_MEM_ONLY: 纯内存档 — CPU 层单独用, 不挂 fs 二级层,
++  # KV 不出 /dev/shm, 不碰慢盘; 代价 = 重启后 KV 全丢. KV_MEM_ONLY=0 回盘档.
++  if [[ "${KV_MEM_ONLY:-0}" == "1" ]]; then
++    python3 - "$KV_DISK_CPU_BYTES" <<'PY'
++import json, sys
++print(json.dumps({
++    "kv_connector": "OffloadingConnector",
++    "kv_role": "kv_both",
++    "kv_connector_extra_config": {
++        "cpu_bytes_to_use": int(sys.argv[1]),
++        "spec_name": "CPUOffloadingSpec",
++    },
++}, separators=(",", ":")))
++PY
++    return 0
++  fi
+   if [[ -z "${DISK_KV_CHECKPOINT_FINGERPRINT:-}" ]]; then
+     echo "ERROR: Disk KV cache checkpoint fingerprint is missing." >&2
+     return 1
+@@ -1776,9 +1826,14 @@ import os
+ import sys
+ 
+ root_dir, cpu_bytes, fingerprint = sys.argv[1:]
++# LOCAL PATCH (2026-11-22) kv_load_failure_policy: 默认 recompute。
++# 磁盘块被外部清理脚本删掉后, 读盘扑空只重算前缀(warning), 不把请求报错给客户端。
++# 上游默认 fail = 该请求直接 500。用 KV_LOAD_FAILURE_POLICY=fail 可改回。
++# 注意: update.sh 覆盖 launcher.sh 后此补丁需重打 (备份 launcher.sh.bak-kvloadpolicy-20261122)。
+ print(json.dumps({
+     "kv_connector": "OffloadingConnector",
+     "kv_role": "kv_both",
++    "kv_load_failure_policy": os.environ.get("KV_LOAD_FAILURE_POLICY", "recompute"),
+     "kv_connector_extra_config": {
+         "cpu_bytes_to_use": int(cpu_bytes),
+         "spec_name": "TieringOffloadingSpec",
+@@ -1794,6 +1849,7 @@ PY
+ prepare_disk_kv_checkpoint_fingerprint() {
+   DISK_KV_CHECKPOINT_FINGERPRINT=""
+   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
++  [[ "${KV_MEM_ONLY:-0}" == "1" ]] && return 0
+ 
+   local method draft_checkpoint=""
+   method=$(effective_speculative_method)
+@@ -5691,7 +5747,7 @@ launch_server() {
+     return 0
+   fi
+ 
+-  if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
++  if [[ -n "${KV_DISK_CACHE_DIR:-}" && "${KV_MEM_ONLY:-0}" != "1" ]]; then
+     mkdir -p -- "$KV_DISK_CACHE_DIR" || return 1
+     if [[ ! -w "$KV_DISK_CACHE_DIR" || ! -x "$KV_DISK_CACHE_DIR" ]]; then
+       echo "ERROR: Disk KV cache directory must be writable and searchable: $KV_DISK_CACHE_DIR" >&2

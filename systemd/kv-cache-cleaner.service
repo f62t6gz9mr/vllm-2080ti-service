@@ -1,0 +1,15 @@
+[Unit]
+Description=vLLM disk KV cache size-limit cleaner (oldest-first, safe with recompute policy)
+# 开机随用户会话自启(linger=yes), 与 vllm-dflash2 一起进入循环; 不依赖 vLLM 是否在跑
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/l/bin/kv-cache-cleaner.py
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+# 清理是低优先级后台活, 不跟推理抢 CPU/磁盘
+
+[Install]
+WantedBy=default.target

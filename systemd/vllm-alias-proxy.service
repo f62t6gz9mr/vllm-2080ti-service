@@ -1,0 +1,17 @@
+[Unit]
+Description=vLLM LAN gateway: model-alias proxy :8001 + Ollama shim :11434 -> 127.0.0.1:8000
+After=vllm-dflash2.service
+
+[Service]
+Type=simple
+User=l
+ExecStart=/usr/bin/python3 /home/l/vllm-2080ti-definitive/model-alias-proxy.py
+Restart=always
+RestartSec=5
+Environment=http_proxy=
+Environment=https_proxy=
+Environment=ALL_PROXY=
+Environment=NO_PROXY=127.0.0.1,localhost
+
+[Install]
+WantedBy=multi-user.target

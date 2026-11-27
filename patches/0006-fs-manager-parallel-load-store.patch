@@ -1,0 +1,143 @@
+diff --git a/vllm/v1/kv_offload/tiering/fs/manager.py b/vllm/v1/kv_offload/tiering/fs/manager.py
+index f73f70e77f..813bd3b0f7 100644
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -195,6 +195,12 @@ class FileSystemTierManager(SecondaryTierManager):
+                 tier_type,
+             )
+ 
++        # PATCH 9b (2026-11-27): 线程数 env 可调 (不设 env 保持原默认 16/16)
++        n_read_threads = int(os.environ.get("KV_FS_READ_THREADS", n_read_threads))
++        n_write_threads = int(
++            os.environ.get("KV_FS_WRITE_THREADS", n_write_threads)
++        )
++
+         self._pool = DualQueueThreadPool(
+             n_read_threads,
+             n_write_threads,
+@@ -219,15 +225,32 @@ class FileSystemTierManager(SecondaryTierManager):
+         keys = list(job_metadata.keys)
+         if self.events is not None:
+             self._store_job_keys[job_metadata.job_id] = keys
+-        task = functools.partial(
+-            batch_store_block,
+-            [self.file_mapper.get_file_name(key) for key in keys],
+-            self._primary_kv_view,
+-            [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
+-            self._block_size,
+-            self._use_o_direct,
+-        )
+-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
++        # PATCH 9 (2026-11-27): 并行写盘, 镜像补丁8。每块砖独立文件、
++        # tmp+rename 原子替换、已存在跳过 —— 拆组不破坏失败语义:
++        # 任一组失败 => 整个 job success=False => 不发事件, 砖按 MISS
++        # 重算兜底, 与旧单任务"首错即停"后果一致。
++        paths = [self.file_mapper.get_file_name(key) for key in keys]
++        offs = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
++        grp = max(1, int(os.environ.get("KV_FS_STORE_GROUP", "4")))
++        if len(paths) <= grp:
++            groups = [(paths, offs)]
++        else:
++            groups = [
++                (paths[x : x + grp], offs[x : x + grp])
++                for x in range(0, len(paths), grp)
++            ]
++        tasks = [
++            functools.partial(
++                batch_store_block,
++                gp_paths,
++                self._primary_kv_view,
++                gp_offsets,
++                self._block_size,
++                self._use_o_direct,
++            )
++            for gp_paths, gp_offsets in groups
++        ]
++        self._pool.enqueue_store(job_metadata.job_id, len(groups), tasks)
+ 
+     @override
+     def submit_load(self, job_metadata: TransferJob) -> None:
+@@ -239,34 +262,56 @@ class FileSystemTierManager(SecondaryTierManager):
+         paths = [self.file_mapper.get_file_name(key) for key in keys]
+         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+ 
+-        def load_task() -> None:
+-            try:
+-                batch_load_block(
+-                    paths,
+-                    self._primary_kv_view,
+-                    offsets,
+-                    self._block_size,
+-                    self._use_o_direct,
+-                )
+-            except OSError as exc:
+-                # Runs on the pool worker thread. Record how many blocks loaded
+-                # before the failure so get_finished_jobs can keep them; this
+-                # write precedes task_done, so the scheduler reads it safely
+-                # under the GIL once the finished queue hands back this job.
+-                num_succeeded = getattr(exc, "num_succeeded", 0)
+-                self._load_progress[job_id] = num_succeeded
+-                # Surfaces errno (e.g. EMFILE "Too many open files") for both
+-                # the C and Python load paths.
+-                logger.debug(
+-                    "Load of %d blocks for job %s failed at block %d: %s",
+-                    len(paths),
+-                    job_id,
+-                    num_succeeded,
+-                    exc,
+-                )
+-                raise
++        # PATCH 8 (2026-11-27): 并行读盘. 砖按组切, 每组一个任务丢进
++        # 16 线程读队列, 实测并行读 ~223MB/s vs 单流 93MB/s。
++        # 失败语义与原单任务一致: "第一个坏块之前的都算数" —— 全局计数
++        # = 首个失败组之前的整组数 + 该组内成功数; 其余组失败不算数。
++        grp = max(1, int(os.environ.get("KV_FS_PARALLEL", "4")))
++        if len(paths) <= grp:
++            groups = [(paths, offsets, 0)]
++        else:
++            groups = [
++                (paths[i : i + grp], offsets[i : i + grp], i)
++                for i in range(0, len(paths), grp)
++            ]
++
++        def make_task(gp_paths, gp_offsets, base):
++            def load_task() -> None:
++                try:
++                    batch_load_block(
++                        gp_paths,
++                        self._primary_kv_view,
++                        gp_offsets,
++                        self._block_size,
++                        self._use_o_direct,
++                    )
++                except OSError as exc:
++                    # Runs on the pool worker thread. Record how many blocks
++                    # loaded before the failure so get_finished_jobs can keep
++                    # them; this write precedes task_done, so the scheduler
++                    # reads it safely under the GIL once the finished queue
++                    # hands back this job.
++                    num_succeeded = getattr(exc, "num_succeeded", 0)
++                    # PATCH 8: 组内进度 -> 全局进度 (取最小失败点即"首个坏块")
++                    self._load_progress[job_id] = min(
++                        base + num_succeeded,
++                        self._load_progress.get(job_id, len(paths)),
++                    )
++                    logger.debug(
++                        "Load of %d blocks for job %s failed at block %d: %s",
++                        len(gp_paths),
++                        job_id,
++                        base + num_succeeded,
++                        exc,
++                    )
++                    raise
++
++            return load_task
+ 
+-        self._pool.enqueue_load(job_id, 1, [load_task])
++        # 预置全局成功上限: 全部成功时无人写, 收口按 len(paths) 处理
++        self._load_progress[job_id] = len(paths)
++        self._pool.enqueue_load(job_id, len(groups),
++                                [make_task(a, b, c) for a, b, c in groups])
+ 
+     @override
+     def get_finished_jobs(self) -> Iterable[JobResult]:

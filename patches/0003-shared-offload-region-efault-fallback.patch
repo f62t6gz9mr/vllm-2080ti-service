@@ -1,0 +1,26 @@
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index 46a1e7ae64..25655b87a3 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -55,10 +55,20 @@ def _get_populate_write_fn(
+     mmap_obj: mmap.mmap,
+ ) -> Callable[[mmap.mmap, int, int], None]:
+     """Select the pre-faulting method once for this mmap."""
++    # LOCAL PATCH 2 rev-B(2026-11-26): 懒预填充 — 启动时不碰任何页,
++    # tmpfs 页在第一次真实写入(GPU->CPU 搬运)时才按需分配, 柜子随 KV 增长.
++    # (逐页 fallback 版会在启动即占满全区域, 等于预塞 20G, 弃用.)
++    # 页缺失导致的传输报错由上层 recompute 策略兜底.
++    def _lazy_no_populate(mmap_obj, offset, length):
++        return None
++    return _lazy_no_populate
+     try:
+         _madvise_populate_write(mmap_obj, 0, mmap.PAGESIZE)
+     except OSError as e:
+-        if e.errno != errno.EINVAL:
++        # LOCAL PATCH (2026-11-26): 本机内核(7.0.0-31)对 MADV_POPULATE_WRITE
++        # 探测报 EFAULT 而非 EINVAL, 上游只认 EINVAL 直接崩 (参照 vllm PR #51116/#62058
++        # 同类问题). EFAULT/ENOMEM 一律走逐页 fallback, 启动略慢但可跑.
++        if e.errno not in (errno.EINVAL, errno.EFAULT, errno.ENOMEM):
+             raise
+         logger.warning(
+             "MADV_POPULATE_WRITE is not supported; falling back to per-page "

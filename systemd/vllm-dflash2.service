@@ -1,0 +1,25 @@
+[Unit]
+Description=vLLM Qwen3.8-27B NVFP4 + DFlash2 (official 0.2.x route, 2x RTX 2080 Ti)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=l
+Group=l
+SupplementaryGroups=video render
+WorkingDirectory=/home/l
+Environment=HOME=/home/l
+Environment=CUDA_HOME=/usr/local/cuda-13.0
+Environment=PATH=/usr/local/cuda-13.0/bin:/home/l/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=START_TIMEOUT=2400
+LimitMEMLOCK=infinity
+KillMode=none
+ExecStart=/home/l/start-dflash2.sh
+ExecStop=/home/l/stop-dflash2.sh
+TimeoutStartSec=2400
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
