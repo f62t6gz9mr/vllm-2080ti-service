@@ -7,18 +7,21 @@
 - 现象：缓存盘到达 LIMIT_GB 上限、cleaner 删块的瞬间，vLLM 集中刷 `cannot store chunks`——被删的块恰好正被读盘引用（recompute 策略兜底，不报错但白重算）。顶格 170G 时抖动明显。
 - 现状：LIMIT_GB 11-27 已从 170 提到 190（盘 295G 可用），**效果还没观察够**。
 - 待办：继续跑几天看 190G 档抖动频率；若仍明显，考虑给 cleaner 加"删除前查在途引用"或错开写盘高峰。
+- **已改（待上机验证）**：cleaner v2 改按 max(mtime, atime) 淘汰（块只写一次，v1 只看 mtime 会先删最老却最常复用的会话开头）+ 高低水位（190 触发、删到 180）。需要数据盘 `strictatime`（relatime 下反复读不刷新 atime）。先用 `kv-cache-cleaner.py --once --dry-run` 看日志里"创建后被读过 N 个"，N 很大就证实了假设。
 
 ## 2. 数据盘本身变慢（硬件层，暂无解）
 
 - 实测：单流 ~55 MB/s、4 并行 ~223 MB/s——DRAM-less 盘 SLC 缓存耗尽后的典型表现（盘长期 85%+ 占用加剧）。
 - 影响：读盘档（镜像没有→从盘捞回会话）时间直接受它钳制。
 - 待办：无根治方案；备选是换带 DRAM 缓存的盘，或把 LIMIT 再压低给 SLC 留空余（与第 1 条冲突，需权衡）。
+- 零成本可先做：`systemctl enable --now fstrim.timer`（cleaner 大批删除后不 TRIM，DRAM-less 盘会一直认为块在用）；分区缩小留 10–20% 不分配当 OP。
 
 ## 3. update.sh 会覆盖 launcher.sh，补丁全丢
 
 - 现象：上游 `update.sh` 更新后，launcher.sh 里的补丁 1（ALLOW_KV_OVERCOMMIT / recompute / KV_MEM_ONLY）和 fingerprint 缓存补丁（0002）全部回退，服务起不来或启动回到 ~30 分钟。
 - 现状：仓库 patches/ 里留了全套可重放补丁，但**重放是手工的**。
 - 待办：写一个 `reapply-patches.sh`（git apply + 校验 + 失败报警），或干脆把补丁做成 update.sh 后的固定流程。
+- **已写**：`tools/reapply-patches.sh`（幂等：已打跳过、能打就打并复验、冲突报警；`--check` 只查不改；可挂 `ExecStartPre`）。
 
 ## 4. 读盘档精确数字没测出来
 

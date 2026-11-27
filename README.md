@@ -26,6 +26,7 @@
 | vLLM 主服务 | `scripts/start-dflash2.sh` / `stop-dflash2.sh` | `systemd/vllm-dflash2.service`（oneshot，根用户级单元） |
 | 别名网关 | `gateway/model-alias-proxy.py`（纯 stdlib，零依赖） | `systemd/vllm-alias-proxy.service` |
 | KV 缓存清理 | `tools/kv-cache-cleaner.py` + `systemd/kv-cleaner.conf` | `systemd/kv-cache-cleaner.service`（用户级，linger） |
+| 补丁重放 | `tools/reapply-patches.sh`（update.sh 覆盖后幂等重打 `patches/`，`--check` 只查不改） | 可挂 `ExecStartPre` |
 | 重启编排 | `tools/kv-b-orchestrator.sh`（停服→清缓存→重启→冒烟→报告） | 按需手动/定时触发 |
 
 当前路线：`Qwen3.8-27B-NVFP4-v2`（w4a16）+ `Qwen3.8-27B-DFlash2` 草稿模型（投机 7 token，greedy 草稿采样），fp8 KV，262144 满上下文，`MAX_NUM_SEQS=2`，prefix caching + 磁盘前缀缓存。
@@ -58,7 +59,7 @@
 
 ## patches/ —— 6 处 fork 补丁
 
-对 Definitive fork 的本地改动（`git diff` 导出，基线 93c9013e37）。**上游 `update.sh` 覆盖 launcher.sh 后必须重新打**。按顺序 `git apply`：
+对 Definitive fork 的本地改动（`git diff` 导出，基线 93c9013e37）。**上游 `update.sh` 覆盖 launcher.sh 后必须重新打**。按顺序 `git apply`（或直接跑 `tools/reapply-patches.sh <fork目录>`，幂等）：
 
 | 补丁 | 作用 |
 |---|---|
